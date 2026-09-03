@@ -99,61 +99,56 @@ export async function fetchAmexOwedPence(
   return { owedPence: Math.max(0, Math.round(bal.current * 100)), raw: bal };
 }
 
-/**
- * Probe: does TrueLayer expose *pending* card transactions for this Amex
- * connection? Non-fatal — returns the HTTP status and whatever body came
- * back so a caller (the ?dry=1 endpoint) can report it without failing
- * the whole request. Not yet wired into the reconcile target.
- */
-export async function probeAmexPendingTransactions(
-  env: Env,
-  accessToken: string
-): Promise<{
+export interface TxFetchResult {
   status: number;
   ok: boolean;
-  count: number;
-  transactions: Pick<
-    TrueLayerTransaction,
-    "timestamp" | "description" | "amount" | "currency" | "transaction_type"
-  >[];
+  transactions: TrueLayerTransaction[];
   error?: string;
-}> {
-  const res = await fetch(
-    `https://api.truelayer.com/data/v1/cards/${env.TRUELAYER_CARD_ACCOUNT_ID}/transactions/pending`,
-    { headers: { Authorization: `Bearer ${accessToken}` } }
+}
+
+/**
+ * Fetch Amex card transactions. `pending: true` hits the
+ * `/transactions/pending` endpoint (authorised-but-not-settled),
+ * otherwise the settled `/transactions` endpoint with an optional
+ * `from`/`to` window.
+ *
+ * Non-fatal: on any HTTP or parse error it returns `ok: false` with the
+ * status and a snippet, so the reconcile can carry on with degraded
+ * information rather than throwing.
+ */
+export async function fetchAmexTransactions(
+  env: Env,
+  accessToken: string,
+  opts: { pending?: boolean; from?: string; to?: string } = {}
+): Promise<TxFetchResult> {
+  const url = new URL(
+    `https://api.truelayer.com/data/v1/cards/${env.TRUELAYER_CARD_ACCOUNT_ID}/transactions` +
+      (opts.pending ? "/pending" : "")
   );
+  if (opts.from) url.searchParams.set("from", opts.from);
+  if (opts.to) url.searchParams.set("to", opts.to);
+
+  const res = await fetch(url.toString(), {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
   const text = await res.text();
   if (!res.ok) {
-    return {
-      status: res.status,
-      ok: false,
-      count: 0,
-      transactions: [],
-      error: text.slice(0, 500),
-    };
+    return { status: res.status, ok: false, transactions: [], error: text.slice(0, 300) };
   }
-  let results: TrueLayerTransaction[] = [];
   try {
-    results = (JSON.parse(text) as { results?: TrueLayerTransaction[] }).results ?? [];
+    const j = JSON.parse(text) as { results?: TrueLayerTransaction[] };
+    return { status: res.status, ok: true, transactions: j.results ?? [] };
   } catch {
     return {
       status: res.status,
       ok: false,
-      count: 0,
       transactions: [],
-      error: `non-JSON body: ${text.slice(0, 300)}`,
+      error: `non-JSON body: ${text.slice(0, 200)}`,
     };
   }
-  return {
-    status: res.status,
-    ok: true,
-    count: results.length,
-    transactions: results.map((t) => ({
-      timestamp: t.timestamp,
-      description: t.description,
-      amount: t.amount,
-      currency: t.currency,
-      transaction_type: t.transaction_type,
-    })),
-  };
+}
+
+/** Pence value of a TrueLayer transaction amount. */
+export function txPence(t: TrueLayerTransaction): number {
+  return Math.round(t.amount * 100);
 }

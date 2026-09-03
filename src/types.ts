@@ -46,3 +46,14 @@ export interface TrueLayerCardBalance {
   currency: string;
   update_timestamp?: string;
 }
+
+// A spend pushed from the iPhone Shortcut the instant it happens on
+// Apple Wallet, before TrueLayer shows it. The reconcile counts these
+// toward the pot target until the matching transaction appears in
+// TrueLayer's data (pending or posted), or the record ages out.
+export interface PushRecord {
+  id: string; // uuid; also the Monzo dedupe_id for the deposit
+  amount_pence: number;
+  pushed_at: string; // ISO
+  note?: string; // optional merchant text from the Shortcut
+}

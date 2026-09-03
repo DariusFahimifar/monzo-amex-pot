@@ -5,12 +5,23 @@ Amex card (via TrueLayer) and the balance of a Monzo pot, and moves the
 difference so the pot always mirrors what you owe Amex.
 
 **Reconcile model, not per-transaction.** Each run computes
-`delta = max(0, amexOwed) - potBalance` and does one pot deposit
-(`delta > 0`) or withdrawal (`delta < 0`). This is self-correcting:
-refunds, paying the Amex bill, a missed run and FX adjustments all wash
-out on the next run. No cursor, no per-transaction bookkeeping, no
-dedupe. Tracks the card's **posted** balance only, so the pot trails
-pending Amex spend by a few days by design.
+
+```
+target = max(0, posted_owed + Σ pending_debit − Σ pending_credit + Σ unmatched_pushes)
+move   = target − pot_balance      (deposit if +, withdraw if −)
+```
+
+Self-correcting: refunds, paying the Amex bill, a missed run and FX
+adjustments all wash out on the next run. No cursor, no per-transaction
+bookkeeping.
+
+- **posted_owed** — TrueLayer card balance `current`.
+- **pending** — TrueLayer `/transactions/pending`, so the pot covers
+  authorised-but-unsettled Amex spend too.
+- **pushes** — spends sent by an iPhone Shortcut (`POST /`) the instant
+  they hit Apple Wallet, so the pot updates in ~1s instead of waiting
+  for TrueLayer. Each push is dropped once a same-amount transaction
+  appears in TrueLayer's pending/posted data, or after 5 days.
 
 ## 1. Install and log in
 
@@ -107,32 +118,35 @@ to find your Amex card's `account_id` — set that as
 npx wrangler deploy
 ```
 
-## 7. Test it manually before waiting for the cron
+## 7. HTTP interface
 
-Dry run — shows `amex_owed_pence`, `pot_balance_pence`, `delta_pence`,
-the `action` it would take, and the raw TrueLayer balance object, without
-moving money:
+All routes require `Authorization: Bearer <WORKER_AUTH_SECRET>`.
 
-```bash
-curl -s "https://amex-monzo-sync.<your-subdomain>.workers.dev/?dry=1" -H "Authorization: Bearer YOUR_WORKER_AUTH_SECRET"
-```
-
-Real run — reconciles immediately:
+| Request | Effect |
+|---|---|
+| `GET /?dry=1` | Reconcile dry run — returns every figure (`posted_owed_pence`, `pending_debit_pence`, `pending_credit_pence`, `unmatched_push_pence`, `target_pence`, `pot_balance_pence`, `delta_pence`, `action`, `retired_push_ids`, `notes`), moves nothing |
+| `GET /` | Reconcile now |
+| `POST /` with `{"amount_pence": 420}` or `{"amount": 4.20}` (optional `"note"`) | Record a Shortcut push and deposit it into the pot immediately |
 
 ```bash
-curl -s "https://amex-monzo-sync.<your-subdomain>.workers.dev/" -H "Authorization: Bearer YOUR_WORKER_AUTH_SECRET"
+curl -s "https://amex-monzo-sync.<sub>.workers.dev/?dry=1" -H "Authorization: Bearer $S"
+curl -s -X POST "https://amex-monzo-sync.<sub>.workers.dev/" -H "Authorization: Bearer $S" \
+  -H "Content-Type: application/json" -d '{"amount_pence":420,"note":"test"}'
 ```
 
 ## Notes
 
-- Tracks the Amex card's **posted** balance (`current` from TrueLayer's
-  card balance endpoint), not pending spend — so the pot lags recent
-  purchases by a few days.
 - TrueLayer's Amex consent needs re-approving roughly every 90 days
-  (PSD2 requirement) — if `truelayer_tokens` refresh starts failing,
-  that's almost certainly why. Set `ALERT_WEBHOOK_URL` so you find out.
-- Idempotent by construction: each run re-derives the delta from live
-  balances, so a missed run, a failed transfer, or a double-fire just
-  gets corrected on the next run.
-- If you pay the Amex bill, `amexOwed` drops and the next run withdraws
-  the corresponding amount from the pot back to the current account.
+  (PSD2) — if `truelayer_tokens` refresh starts failing, that's why.
+  Set `ALERT_WEBHOOK_URL` to hear about it.
+- Idempotent by construction: each run re-derives `target` from live
+  balances + records, so a missed run, a failed transfer, or a
+  double-fire self-corrects next run.
+- Pay the Amex bill → `posted_owed` drops → next run withdraws that
+  amount from the pot back to the current account.
+- Push matching is by amount only. Identical amounts close together, or
+  an amount that changes on settlement (tips/FX), can mis-match and
+  leave the pot off by one transaction until the push expires (5 days)
+  and the posted balance catches up.
+- KV keys: `monzo_tokens`, `truelayer_tokens`, `pushed_pending` (live
+  push records), `last_run_iso` (informational).
