@@ -1,0 +1,138 @@
+# Amex → Monzo pot reconcile
+
+Cloudflare Worker that, on a cron schedule, reads the balance owed on an
+Amex card (via TrueLayer) and the balance of a Monzo pot, and moves the
+difference so the pot always mirrors what you owe Amex.
+
+**Reconcile model, not per-transaction.** Each run computes
+`delta = max(0, amexOwed) - potBalance` and does one pot deposit
+(`delta > 0`) or withdrawal (`delta < 0`). This is self-correcting:
+refunds, paying the Amex bill, a missed run and FX adjustments all wash
+out on the next run. No cursor, no per-transaction bookkeeping, no
+dedupe. Tracks the card's **posted** balance only, so the pot trails
+pending Amex spend by a few days by design.
+
+## 1. Install and log in
+
+```bash
+npm install
+npx wrangler login
+```
+
+## 2. Create the KV namespace
+
+```bash
+npx wrangler kv namespace create AMEX_SYNC_KV
+```
+
+Copy the returned `id` into `wrangler.toml` under `[[kv_namespaces]]`.
+
+## 3. Register your apps
+
+- **Monzo**: create a *confidential* OAuth client at developers.monzo.com.
+  Confidential clients get a refresh_token — required for unattended
+  running. Note the `client_id` / `client_secret`.
+- **TrueLayer**: in Console, create an app, enable the `cards` and
+  `transactions` scopes, and enable `offline_access` (this is what gets
+  you a refresh_token). Note the `client_id` / `client_secret`.
+
+## 4. Set secrets
+
+```bash
+npx wrangler secret put MONZO_CLIENT_ID
+npx wrangler secret put MONZO_CLIENT_SECRET
+npx wrangler secret put MONZO_ACCOUNT_ID
+npx wrangler secret put MONZO_POT_ID
+npx wrangler secret put TRUELAYER_CLIENT_ID
+npx wrangler secret put TRUELAYER_CLIENT_SECRET
+npx wrangler secret put TRUELAYER_CARD_ACCOUNT_ID
+npx wrangler secret put WORKER_AUTH_SECRET   # any random string you make up
+npx wrangler secret put ALERT_WEBHOOK_URL    # optional — Slack/Discord webhook URL
+```
+
+You won't have `MONZO_ACCOUNT_ID`, `MONZO_POT_ID`, or
+`TRUELAYER_CARD_ACCOUNT_ID` yet — you'll get them from the one-time auth
+flow below, then come back and set them.
+
+## 5. One-time OAuth flow (run these from your own machine, not the Worker)
+
+This only needs doing once per app (and again if you ever revoke access).
+
+> Shortcut: `npm run onboard:monzo` and `npm run onboard:truelayer` walk
+> the whole flow (code exchange, ID lookup, KV seed command) locally.
+> See `NEXT_STEPS.md`. The manual steps below are the fallback.
+
+**Monzo:**
+
+1. Send yourself to:
+   `https://auth.monzo.com/?client_id=YOUR_CLIENT_ID&redirect_uri=YOUR_REDIRECT_URI&response_type=code&state=random123`
+   (use `http://localhost:3000/callback` or similar as the redirect URI —
+   registered in the Monzo developer portal for this client)
+2. Approve access in the Monzo app when prompted.
+3. Exchange the `code` you're redirected back with:
+   ```bash
+   curl https://api.monzo.com/oauth2/token \
+     -d grant_type=authorization_code \
+     -d client_id=YOUR_CLIENT_ID \
+     -d client_secret=YOUR_CLIENT_SECRET \
+     -d redirect_uri=YOUR_REDIRECT_URI \
+     -d code=THE_CODE_FROM_THE_REDIRECT
+   ```
+4. From the response, note `access_token`, `refresh_token`, `expires_in`,
+   and call `GET https://api.monzo.com/accounts` (Bearer token) to find
+   your `account_id`, and `GET https://api.monzo.com/pots?current_account_id=...`
+   to find your Amex pot's `id`. Set those as `MONZO_ACCOUNT_ID` /
+   `MONZO_POT_ID` (step 4 above).
+5. Seed KV with the token pair:
+   ```bash
+   npx wrangler kv key put --binding=AMEX_SYNC_KV monzo_tokens \
+     '{"access_token":"...","refresh_token":"...","expires_at":1234567890000}' --remote
+   ```
+   (`expires_at` = now in epoch **milliseconds** + `expires_in * 1000`)
+
+   **The `--remote` flag is required.** Without it, wrangler v4 writes to
+   a local on-disk KV simulation and the deployed Worker sees nothing.
+
+**TrueLayer:** follow the same shape using TrueLayer's auth
+(`https://auth.truelayer.com/?...`) and token endpoint
+(`https://auth.truelayer.com/connect/token`), consenting against your
+Amex account. Then call `GET https://api.truelayer.com/data/v1/cards`
+to find your Amex card's `account_id` — set that as
+`TRUELAYER_CARD_ACCOUNT_ID`. Seed KV the same way under the key
+`truelayer_tokens`.
+
+## 6. Deploy
+
+```bash
+npx wrangler deploy
+```
+
+## 7. Test it manually before waiting for the cron
+
+Dry run — shows `amex_owed_pence`, `pot_balance_pence`, `delta_pence`,
+the `action` it would take, and the raw TrueLayer balance object, without
+moving money:
+
+```bash
+curl -s "https://amex-monzo-sync.<your-subdomain>.workers.dev/?dry=1" -H "Authorization: Bearer YOUR_WORKER_AUTH_SECRET"
+```
+
+Real run — reconciles immediately:
+
+```bash
+curl -s "https://amex-monzo-sync.<your-subdomain>.workers.dev/" -H "Authorization: Bearer YOUR_WORKER_AUTH_SECRET"
+```
+
+## Notes
+
+- Tracks the Amex card's **posted** balance (`current` from TrueLayer's
+  card balance endpoint), not pending spend — so the pot lags recent
+  purchases by a few days.
+- TrueLayer's Amex consent needs re-approving roughly every 90 days
+  (PSD2 requirement) — if `truelayer_tokens` refresh starts failing,
+  that's almost certainly why. Set `ALERT_WEBHOOK_URL` so you find out.
+- Idempotent by construction: each run re-derives the delta from live
+  balances, so a missed run, a failed transfer, or a double-fire just
+  gets corrected on the next run.
+- If you pay the Amex bill, `amexOwed` drops and the next run withdraws
+  the corresponding amount from the pot back to the current account.

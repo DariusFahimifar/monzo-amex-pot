@@ -1,0 +1,15 @@
+name = "amex-monzo-sync"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+# Runs every 15 minutes. Cloudflare's free plan allows 1-minute minimum,
+# so tighten this if you want faster sweeps — just mind your TrueLayer
+# and Monzo rate limits if you go very frequent.
+[triggers]
+crons = ["*/15 * * * *"]
+
+# Create with: wrangler kv namespace create AMEX_SYNC_KV
+# then paste the returned id below.
+[[kv_namespaces]]
+binding = "AMEX_SYNC_KV"
+id = "7b4e92dc51c9495a8df8ad7c3ca078f1"
