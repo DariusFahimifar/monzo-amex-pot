@@ -1,5 +1,11 @@
 # Handoff: Amex → Monzo pot sweep
 
+> **📜 Archived.** This was the original handoff doc from before the
+> project was live — it describes a stuck OAuth flow and a
+> per-transaction "sweep" design, both long superseded. Kept only as a
+> historical record of the original brief. For current architecture see
+> `README.md`; for live status and open items see `NEXT_STEPS.md`.
+>
 > **Update 2026-08-29**: Repo restructured into `src/`, dependency
 > conflict fixed, `tsc` + `wrangler deploy --dry-run` both pass. Added
 > `scripts/onboard.mjs` to automate the OAuth flows locally. Remaining

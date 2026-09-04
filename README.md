@@ -1,5 +1,9 @@
 # Amex → Monzo pot reconcile
 
+> **Current live status, open test items, and the cron on/off state:
+> see `NEXT_STEPS.md`.** This file is the architecture/setup reference;
+> that one is the day-to-day runbook and changes more often.
+
 Cloudflare Worker that, on a cron schedule, reads the balance owed on an
 Amex card (via TrueLayer) and the balance of a Monzo pot, and moves the
 difference so the pot always mirrors what you owe Amex.
@@ -133,6 +137,25 @@ curl -s "https://amex-monzo-sync.<sub>.workers.dev/?dry=1" -H "Authorization: Be
 curl -s -X POST "https://amex-monzo-sync.<sub>.workers.dev/" -H "Authorization: Bearer $S" \
   -H "Content-Type: application/json" -d '{"amount_pence":420,"note":"test"}'
 ```
+
+## 8. iPhone Shortcut (optional — instant push)
+
+Shortcuts app → **Automation** → **+** → **Create Personal Automation**
+→ **Transaction** → pick the Amex card, Amount = Any → Next.
+
+Add action **Get Contents of URL**:
+
+| Field | Value |
+|---|---|
+| URL | the Worker URL |
+| Method | `POST` |
+| Headers | `Authorization: Bearer <WORKER_AUTH_SECRET>`, `Content-Type: application/json` |
+| Request Body (JSON) | `amount` (Number) = **Transaction Amount** variable, `note` (Text) = **Transaction Merchant** (optional) |
+
+Turn off "Ask Before Running". Only fires reliably for **in-person
+tap-to-pay** (a known limitation of the Transaction automation trigger,
+not this Worker) — online/in-app Apple Pay spend is still covered, just
+by the cron instead of instantly. See `NEXT_STEPS.md` for testing status.
 
 ## Notes
 

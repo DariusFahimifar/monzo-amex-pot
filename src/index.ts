@@ -184,11 +184,19 @@ async function runReconcile(
 // pounds, plus optional { note } / { merchant }. Records the spend and
 // immediately deposits it into the pot.
 async function handlePush(request: Request, env: Env): Promise<Response> {
+  const rawBody = await request.text();
+  console.log(
+    `push: content-type=${request.headers.get("content-type")} raw=${rawBody.slice(0, 300)}`
+  );
+
   let body: Record<string, unknown>;
   try {
-    body = (await request.json()) as Record<string, unknown>;
+    body = JSON.parse(rawBody) as Record<string, unknown>;
   } catch {
-    return Response.json({ error: "body must be JSON" }, { status: 400 });
+    return Response.json(
+      { error: "body must be JSON", received: rawBody.slice(0, 200) },
+      { status: 400 }
+    );
   }
 
   let pence: number | undefined;
@@ -199,7 +207,10 @@ async function handlePush(request: Request, env: Env): Promise<Response> {
   }
   if (pence === undefined) {
     return Response.json(
-      { error: "provide amount_pence (integer) or amount (pounds)" },
+      {
+        error: "provide amount_pence (integer) or amount (pounds)",
+        received: { amount: body.amount, amount_pence: body.amount_pence },
+      },
       { status: 400 }
     );
   }

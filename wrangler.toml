@@ -2,12 +2,18 @@ name = "amex-monzo-sync"
 main = "src/index.ts"
 compatibility_date = "2026-08-01"
 
+# Persist invocation logs (viewable in the dashboard "Logs" tab and via
+# `wrangler tail`). Needed to debug Shortcut calls after the fact.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 # Runs every 15 minutes. Cloudflare's free plan allows 1-minute minimum,
 # so tighten this if you want faster sweeps — just mind your TrueLayer
 # and Monzo rate limits if you go very frequent.
 [triggers]
-crons = ["*/15 * * * *"]
-
+crons = []
+# "*/15 * * * *"
 # Create with: wrangler kv namespace create AMEX_SYNC_KV
 # then paste the returned id below.
 [[kv_namespaces]]
