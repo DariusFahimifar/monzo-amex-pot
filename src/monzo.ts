@@ -13,7 +13,8 @@ export async function getValidMonzoToken(env: Env): Promise<string> {
   if (!raw) {
     throw new Error(
       "No Monzo tokens found in KV. Run the one-time auth flow described " +
-        "in the README to seed 'monzo_tokens' before the first sync."
+        "in CLAUDE.md (`npm run onboard:monzo`) to seed 'monzo_tokens' " +
+        "before the first sync."
     );
   }
 
