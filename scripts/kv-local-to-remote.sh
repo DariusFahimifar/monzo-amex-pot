@@ -6,7 +6,13 @@
 # Worker only ever sees --remote. Run this once from the project root.
 set -euo pipefail
 
-NSID="7b4e92dc51c9495a8df8ad7c3ca078f1"   # matches wrangler.toml
+WRANGLER_TOML="$(dirname "$0")/../wrangler.toml"
+NSID="$(grep -m1 '^id = ' "$WRANGLER_TOML" | sed -E 's/^id = "(.*)"/\1/')"
+if [[ -z "$NSID" ]]; then
+  echo "Could not find a KV namespace id in $WRANGLER_TOML" >&2
+  exit 1
+fi
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
