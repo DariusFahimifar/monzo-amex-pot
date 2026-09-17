@@ -2,8 +2,10 @@
 // One-time OAuth onboarding helper for the Amex -> Monzo pot sweep.
 //
 // Runs entirely on your machine. Nothing is sent anywhere except Monzo
-// and TrueLayer's own token/data endpoints. No secrets are printed back
-// except the token JSON you need to paste into `wrangler kv key put`.
+// and TrueLayer's own token/data endpoints, plus wrangler talking to
+// your own Cloudflare account. At the end it offers to apply the
+// resulting Worker secrets + KV token seed for you via `wrangler`
+// directly (no copy-paste) — decline to fall back to printed commands.
 //
 // Usage:
 //   node scripts/onboard.mjs monzo
@@ -27,6 +29,7 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 
 // Auto-load .env.onboard (if present) so you don't have to `source` it.
 // Values already in the environment win.
@@ -57,7 +60,25 @@ function need(name) {
   return v;
 }
 
-function printTokenSeed(kvKey, data) {
+// Runs a wrangler subcommand for real, piping `input` in on stdin when
+// given (that's how `wrangler secret put NAME` takes its value
+// non-interactively — no TTY prompt, no copy-paste, no risk of a
+// stray shell-comment or a stale value getting pasted by hand).
+function runWrangler(args, input) {
+  const res = spawnSync("npx", ["wrangler", ...args], {
+    input,
+    encoding: "utf8",
+    stdio: [input === undefined ? "inherit" : "pipe", "pipe", "pipe"],
+  });
+  if (res.status !== 0) {
+    die(
+      `npx wrangler ${args.join(" ")} failed (exit ${res.status}):\n${res.stderr || res.stdout}`
+    );
+  }
+  return res.stdout;
+}
+
+function buildTokenSet(data) {
   const tokenSet = {
     access_token: data.access_token,
     refresh_token: data.refresh_token,
@@ -70,18 +91,54 @@ function printTokenSeed(kvKey, data) {
         "was not in the scope list. Fix that and re-run."
     );
   }
-  const json = JSON.stringify(tokenSet);
-  console.log(`\n─── Seed KV (${kvKey}) ─────────────────────────────────────`);
-  console.log(
-    `npx wrangler kv key put --binding=AMEX_SYNC_KV ${kvKey} '${json}' --remote`
-  );
-  console.log(
-    "\n⚠ The --remote flag is REQUIRED. Without it wrangler v4 writes to a\n" +
-      "  local on-disk KV simulation and the deployed Worker sees nothing."
-  );
-  console.log(
-    `\n(access token expires ${new Date(tokenSet.expires_at).toISOString()})`
-  );
+  return tokenSet;
+}
+
+// Applies a batch of { secretName: value } Worker secrets and one KV
+// seed for real, via `wrangler`, then prints what was done (values
+// only ever shown truncated). Falls back to printing copy-paste
+// commands instead if the user declines.
+async function applyOrPrint(secrets, kvKey, tokenSet) {
+  const short = (v) => (v.length > 12 ? v.slice(0, 6) + "…" + v.slice(-4) : v);
+
+  console.log(`\n─── Ready to apply ────────────────────────────────────────`);
+  for (const [name, value] of Object.entries(secrets)) {
+    console.log(`  secret  ${name} = ${short(value)}`);
+  }
+  console.log(`  kv      ${kvKey}  (new access/refresh token pair)`);
+
+  const answer = (await ask("\nApply these now with wrangler? [Y/n] "))
+    .trim()
+    .toLowerCase();
+
+  if (answer === "n" || answer === "no") {
+    console.log("\nSkipped — here are the commands to run yourself instead:\n");
+    for (const [name, value] of Object.entries(secrets)) {
+      console.log(`Run:  npx wrangler secret put ${name}\nWhen prompted, paste:  ${value}\n`);
+    }
+    console.log(
+      `Run:  npx wrangler kv key put --binding=AMEX_SYNC_KV ${kvKey} '${JSON.stringify(tokenSet)}' --remote`
+    );
+    return false;
+  }
+
+  for (const [name, value] of Object.entries(secrets)) {
+    console.log(`\n… setting ${name}`);
+    runWrangler(["secret", "put", name], value);
+  }
+  console.log(`\n… seeding KV (${kvKey})`);
+  runWrangler([
+    "kv",
+    "key",
+    "put",
+    "--binding=AMEX_SYNC_KV",
+    kvKey,
+    JSON.stringify(tokenSet),
+    "--remote",
+  ]);
+  console.log(`\n(access token expires ${new Date(tokenSet.expires_at).toISOString()})`);
+  console.log("✓ Applied.");
+  return true;
 }
 
 async function httpForm(url, params) {
@@ -179,23 +236,19 @@ async function onboardMonzo() {
   const amexPot =
     livePots.find((p) => /amex/i.test(p.name)) || null;
 
-  console.log(`\n─── Secrets to set ────────────────────────────────────────`);
-  console.log(`MONZO_ACCOUNT_ID = ${retail.id}`);
-  console.log(
-    `MONZO_POT_ID     = ${
-      amexPot ? amexPot.id + `  ("${amexPot.name}")` : "<pick the pot id from the list above>"
-    }`
-  );
-  console.log(
-    `\nnpx wrangler secret put MONZO_ACCOUNT_ID   # -> ${retail.id}`
-  );
-  console.log(
-    `npx wrangler secret put MONZO_POT_ID       # -> ${
-      amexPot ? amexPot.id : "<pot id>"
-    }`
-  );
+  let potId = amexPot?.id;
+  if (!potId) {
+    console.log("\nNo pot name matched /amex/i — pick one from the list above.");
+    potId = (await ask("Pot id to use for MONZO_POT_ID: ")).trim();
+    if (!potId) die("No pot id given.");
+  }
 
-  printTokenSeed("monzo_tokens", tok);
+  const tokenSet = buildTokenSet(tok);
+  await applyOrPrint(
+    { MONZO_ACCOUNT_ID: retail.id, MONZO_POT_ID: potId },
+    "monzo_tokens",
+    tokenSet
+  );
 }
 
 async function onboardTrueLayer() {
@@ -274,19 +327,31 @@ async function onboardTrueLayer() {
     )
   );
 
-  console.log(`\n─── Secret to set ─────────────────────────────────────────`);
+  let accountId = amex?.account_id;
+  if (!accountId) {
+    console.log("\nNo card auto-matched as Amex — pick an account_id from the list above.");
+    accountId = (await ask("account_id to use for TRUELAYER_CARD_ACCOUNT_ID: ")).trim();
+    if (!accountId) die("No account_id given.");
+  }
+  const chosen = results.find((c) => c.account_id === accountId);
   console.log(
-    `TRUELAYER_CARD_ACCOUNT_ID = ${
-      amex ? amex.account_id : "<pick the Amex account_id above>"
-    }`
-  );
-  console.log(
-    `\nnpx wrangler secret put TRUELAYER_CARD_ACCOUNT_ID   # -> ${
-      amex ? amex.account_id : "<account_id>"
-    }`
+    `\nUsing: ${accountId}  ${chosen?.display_name || ""}  ****${chosen?.partial_card_number || "????"}` +
+      "  <- confirm this is the right card before continuing"
   );
 
-  printTokenSeed("truelayer_tokens", tok);
+  const tokenSet = buildTokenSet(tok);
+  const applied = await applyOrPrint(
+    { TRUELAYER_CARD_ACCOUNT_ID: accountId },
+    "truelayer_tokens",
+    tokenSet
+  );
+
+  if (applied) {
+    console.log(
+      "\nNext: `?dry=1` against the deployed Worker should now show " +
+        "posted_owed_pence for this card (near £0 if it's brand new)."
+    );
+  }
 }
 
 const cmd = process.argv[2];

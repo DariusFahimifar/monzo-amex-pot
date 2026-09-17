@@ -3,20 +3,70 @@
 Cloudflare Worker that, on a cron schedule, reads the balance owed on an
 Amex card (via TrueLayer) and the balance of a Monzo pot, and moves the
 difference so the pot always mirrors what's owed on Amex — for
-budgeting (money already earmarked for the Amex bill sits visibly ring-fenced,
-not mixed into spendable balance).
+budgeting (money already earmarked for the Amex bill sits visibly ring-fenced, not mixed into spendable balance).
 
-> **Before touching this project, read `NEXT_STEPS.md`** — it's the
-> live runbook: whether the cron is currently on/off, open test items,
-> and anything mid-flight. This file is the stable architecture/setup
-> reference and changes rarely; `NEXT_STEPS.md` changes every session.
+> If you're the maintainer working locally: check your own
+> `NEXT_STEPS.md` first — it's a live, personal runbook (current cron
+> on/off state, open test items, anything mid-flight) that's
+> deliberately gitignored and not part of this repo, since it tends to
+> accumulate account-specific details. This file is the stable
+> architecture/setup reference and changes rarely.
+
+## System design
+
+```mermaid
+flowchart LR
+    Amex[Amex card]
+    DD[Amex Direct Debit\n15th of each month]
+    TL[TrueLayer]
+    Shortcut[Apple Shortcuts]
+    Cron[Cron trigger\n0 * * * * — hourly]
+    Worker[Cloudflare Worker]
+    KV[(AMEX_SYNC_KV\ntokens + live pushed_pending only\nno permanent history)]
+    Current[Monzo current account]
+    Pot[Monzo Amex pot]
+    Alert[Alert webhook\nnot configured]
+
+    Amex <--> TL
+    TL <--> Worker
+    Cron -- scheduled trigger --> Worker
+    Shortcut -- POST push --> Worker
+    Worker <--> KV
+    Worker <--> Current
+    Worker <--> Pot
+    DD -- pulls statement balance --> Pot
+    Worker -. on reconcile failure .-> Alert
+```
+
+The cron trigger, not the Shortcut, is what normally drives a
+reconcile — it fires hourly regardless of user action. The Shortcut
+POST is a fast-path: it records a push in KV and deposits immediately,
+so the pot updates in ~1s instead of waiting for the next cron tick.
+Both paths go through the same KV-backed state (OAuth tokens for
+TrueLayer/Monzo, plus the `pushed_pending` records used to avoid
+double-funding a push once TrueLayer's own feed catches up) — nothing
+here is a permanent transaction log, see KV keys below.
+
+The Monzo side is two distinct places, not one: the **current
+account** (spendable balance) and the **Amex pot** (ring-fenced,
+excluded from spendable balance). `movePotFunds` moves money between
+them. The Amex direct debit pulls the statement balance directly from
+the **pot** (confirmed — not the current account), which is why the
+design works at all; if it instead pulled from the current account,
+the ring-fenced pot money would be unreachable to it. There's a known
+settlement-lag artifact around each DD: the DD reduces the pot
+instantly, but TrueLayer's `current` balance doesn't reflect the Amex
+payment until it settles, so the Worker briefly sees a stale high
+target and refunds the pot from the current account, then withdraws it
+straight back out once `current` catches up — self-correcting, but
+worth drawing as a note near that edge if useful, not a fourth node.
 
 ## Model
 
 **Target-balance reconcile, not per-transaction.** Each run computes:
 
 ```
-target = max(0, posted_owed + Σ pending_debit − Σ pending_credit + Σ unmatched_pushes)
+target = max(0, posted_owed + pending_debit − pending_credit + unmatched_pushes)
 move   = target − pot_balance      (deposit if +, withdraw if −)
 ```
 
@@ -31,7 +81,7 @@ doc and the code ever disagree.
   authorised-but-unsettled Amex spend too.
 - **pushes** — spends sent by an iPhone Shortcut (`POST /`) the instant
   they hit Apple Wallet, so the pot updates in ~1s instead of waiting
-  for TrueLayer. Each push is dropped once a same-**amount** DEBIT
+  for cron job to run every 15 minutes. Each push is dropped once a same-**amount** DEBIT
   shows up in TrueLayer's pending or last-5-days posted data, or after
   5 days (failsafe). Matching is amount-only — two identical amounts
   close together, or an amount that changes on settlement (tip/FX), can
@@ -75,20 +125,18 @@ Copy the returned `id` into `wrangler.toml` under `[[kv_namespaces]]`.
 ```bash
 npx wrangler secret put MONZO_CLIENT_ID
 npx wrangler secret put MONZO_CLIENT_SECRET
-npx wrangler secret put MONZO_ACCOUNT_ID
-npx wrangler secret put MONZO_POT_ID
 npx wrangler secret put TRUELAYER_CLIENT_ID
 npx wrangler secret put TRUELAYER_CLIENT_SECRET
-npx wrangler secret put TRUELAYER_CARD_ACCOUNT_ID
 npx wrangler secret put WORKER_AUTH_SECRET   # any random string you make up
 npx wrangler secret put ALERT_WEBHOOK_URL    # optional — Slack/Discord webhook URL
 ```
 
-You won't have `MONZO_ACCOUNT_ID`, `MONZO_POT_ID`, or
-`TRUELAYER_CARD_ACCOUNT_ID` yet — you'll get them from the one-time auth
-flow below, then come back and set them. Run each `secret put` one at a
-time — pasting several lines together feeds the next command in as the
-secret value for the current one.
+`MONZO_ACCOUNT_ID`, `MONZO_POT_ID`, and `TRUELAYER_CARD_ACCOUNT_ID` are
+*not* set here — the one-time auth flow below sets those for you
+directly. Run each `secret put` above one at a time — pasting several
+lines together feeds the next command in as the secret value for the
+current one, and run each bare with nothing trailing on the line (see
+Gotchas: zsh doesn't treat a trailing `#` as a comment interactively).
 
 ### 5. One-time OAuth flow
 
@@ -101,9 +149,18 @@ npm run onboard:truelayer   # browser approve -> pick Amex -> consent -> paste c
 ```
 
 `scripts/onboard.mjs` does the code exchange, ID lookup (Monzo
-account/pot, TrueLayer card), and prints the exact `wrangler secret
-put` / `wrangler kv key put ... --remote` commands to run — auto-loads
+account/pot, TrueLayer card), then offers to **apply the result
+directly via `wrangler`** — sets `MONZO_ACCOUNT_ID`/`MONZO_POT_ID` or
+`TRUELAYER_CARD_ACCOUNT_ID` and seeds the matching KV token pair itself
+(`--remote`, correctly), so nothing needs retyping by hand. Decline the
+prompt to get the old printed copy-paste commands instead. Auto-loads
 config from `.env.onboard` (gitignored; copy from `.env.example`).
+
+This exists because a manual card swap once set `TRUELAYER_CARD_ACCOUNT_ID`
+to a stale value by hand and it silently pointed at the wrong (revoked)
+connection until a `?dry=1` check surfaced `404 account_not_found` —
+letting the script apply its own output removes that whole class of
+mistake.
 
 **The `--remote` flag on `wrangler kv key put/get/list` is required.**
 Without it, wrangler v4 writes to a local on-disk KV simulation and the
@@ -174,6 +231,29 @@ an actual purchase. Not a bug; don't chase it.
 expires_at}`), `pushed_pending` (live Shortcut push records), `last_run_iso`
 (informational, set on non-dry runs only).
 
+**No permanent transaction history is kept anywhere.** This is
+deliberate, not an oversight — it follows from the target-balance
+design: everything is recomputed live each run instead of accumulated,
+so there's nothing to persist.
+
+- `pushed_pending` holds a push only until it resolves, then it's
+  genuinely deleted, not archived — `runReconcile` overwrites the key
+  with just the still-unmatched `kept` array once any push retires
+  (matched against TrueLayer, or expired after `PUSH_RETIRE_AFTER_MS`).
+  There's no separate history/archive collection.
+- TrueLayer's pending/posted transaction data is never written to KV
+  at all — `fetchAmexTransactions` pulls it fresh from the API every
+  run and it only lives in memory for that invocation.
+- The only durable record of what happened is Cloudflare's own
+  observability Logs (dashboard **Logs** tab), and that's ~3-day
+  retention, not permanent — and even within that window it only logs
+  aggregate counts (`retired=N`) for successful push matches, not which
+  specific push matched which transaction; only expired/unmatched
+  pushes get an individual note.
+
+If a permanent audit trail of reconciled spend is ever wanted (e.g. for
+budgeting history), that needs new code — nothing here provides it.
+
 ## Gotchas
 
 - **`--remote` on every `wrangler kv` command** that touches what the
@@ -198,5 +278,13 @@ expires_at}`), `pushed_pending` (live Shortcut push records), `last_run_iso`
 - Run one `wrangler secret put NAME` at a time — pasting several
   commands together feeds the next line in as the current secret's
   value.
+- **Run `wrangler secret put NAME` bare, with nothing trailing on the
+  same line** — zsh (the default here) does not treat a trailing `#
+  comment` as a comment in an interactive shell the way bash does, so
+  anything after `#` gets parsed as extra CLI arguments and fails with
+  "unknown argument". `scripts/onboard.mjs` prints the command and the
+  value to paste on separate lines for this reason — always run the
+  command alone, then paste the value only when the interactive prompt
+  asks for it.
 - `wrangler` is a local devDependency, not a global command — always
   `npx wrangler ...` or `npm run <script>`.
