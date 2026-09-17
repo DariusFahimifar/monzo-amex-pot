@@ -19,7 +19,7 @@ export async function getValidTrueLayerToken(env: Env): Promise<string> {
   if (!raw) {
     throw new Error(
       "No TrueLayer tokens found in KV. Run the one-time auth flow " +
-        "described in CLAUDE.md (`npm run onboard:truelayer`) to seed " +
+        "described in AGENTS.md (`npm run onboard:truelayer`) to seed " +
         "'truelayer_tokens' before the first sync."
     );
   }
