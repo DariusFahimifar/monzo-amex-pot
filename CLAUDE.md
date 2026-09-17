@@ -5,13 +5,6 @@ Amex card (via TrueLayer) and the balance of a Monzo pot, and moves the
 difference so the pot always mirrors what's owed on Amex — for
 budgeting (money already earmarked for the Amex bill sits visibly ring-fenced, not mixed into spendable balance).
 
-> If you're the maintainer working locally: check your own
-> `NEXT_STEPS.md` first — it's a live, personal runbook (current cron
-> on/off state, open test items, anything mid-flight) that's
-> deliberately gitignored and not part of this repo, since it tends to
-> accumulate account-specific details. This file is the stable
-> architecture/setup reference and changes rarely.
-
 ## System design
 
 ```mermaid
