@@ -87,11 +87,30 @@ transactions, but TrueLayer date-stamps Amex transactions at
 later — no moving "since" window ever lines up with them. Rebuilt as a
 target-balance reconcile instead, which is immune to that.
 
+## Prerequisites
+
+- **Node.js 22+** (Wrangler 4's actual minimum — check with `node -v`).
+- A **Cloudflare account** (free tier is enough — see Gotchas for the
+  free-plan cron trigger limit).
+- A **UK Monzo personal account**, with the Monzo app installed and
+  **at least one pot already created** — the onboarding flow lists
+  your pots and either auto-matches one named with "amex" in it or
+  lets you pick, but it needs at least one to exist first.
+- A **TrueLayer account** (console.truelayer.com, free) for API
+  credentials, and a card TrueLayer supports via UK/EU Open Banking
+  (PSD2) — built and tested against Amex, but nothing in the code is
+  Amex-specific; any card TrueLayer exposes a balance/transactions feed
+  for should work the same way.
+- Optional: an iPhone, only needed for the Shortcuts instant-push
+  fast-path — the hourly cron path works without it.
+
 ## Setup
 
-### 1. Install and log in
+### 1. Clone, install, and log in
 
 ```bash
+git clone <this-repo-url>
+cd monzo-amex-pot
 npm install
 npx wrangler login
 ```
@@ -249,6 +268,9 @@ budgeting history), that needs new code — nothing here provides it.
 
 ## Gotchas
 
+- **Cloudflare's free plan allows 5 cron triggers per account** (not
+  per Worker) — this project only needs one, but worth knowing if
+  you're running other scheduled Workers on the same account.
 - **`--remote` on every `wrangler kv` command** that touches what the
   Worker reads — see Setup §5.
 - **TrueLayer consent expires ~90 days** (PSD2) regardless of use;
