@@ -5,3 +5,6 @@ node_modules/
 .env.*
 !.env.example
 .DS_Store
+# Personal/live runbook — account IDs, card details, session-to-session
+# status. Not meant for the public repo; see CLAUDE.md.
+NEXT_STEPS.md
