@@ -46,20 +46,20 @@ excluded from spendable balance). `movePotFunds` moves money between
 them. The Amex direct debit pulls the statement balance directly from
 the **pot** (confirmed — not the current account), which is why the
 design works at all; if it instead pulled from the current account,
-the ring-fenced pot money would be unreachable to it. There's a known
-settlement-lag artifact around each DD: the DD reduces the pot
-instantly, but TrueLayer's `current` balance doesn't reflect the Amex
-payment until it settles, so the Worker briefly sees a stale high
-target and refunds the pot from the current account, then withdraws it
-straight back out once `current` catches up — self-correcting, but
-worth drawing as a note near that edge if useful, not a fourth node.
+the ring-fenced pot money would be unreachable to it. A DD takes a
+couple of days to land on the card, and until it does TrueLayer's
+`current` still includes it — so the Worker also reads the Monzo
+current account's recent transactions and subtracts payments to Amex
+that haven't landed yet (see **in_flight** below). Without that it
+would refund the just-paid bill back into the pot from the current
+account for those days.
 
 ## Model
 
 **Target-balance reconcile, not per-transaction.** Each run computes:
 
 ```
-target = max(0, posted_owed + pending_debit − pending_credit + unmatched_pushes)
+target = max(0, posted_owed + pending_debit − pending_credit + unmatched_pushes − in_flight)
 move   = target − pot_balance      (deposit if +, withdraw if −)
 ```
 
@@ -69,9 +69,25 @@ bookkeeping. Full reasoning for every piece of this is in the header
 comment of `src/index.ts` — treat that as the source of truth if this
 doc and the code ever disagree.
 
-- **posted_owed** — TrueLayer card balance `current` (settled only).
+- **posted_owed** — TrueLayer card balance `current`. Excludes pending
+  spend, but *does* drop as soon as a payment to the card shows as a
+  pending CREDIT.
 - **pending** — TrueLayer `/transactions/pending`, so the pot covers
-  authorised-but-unsettled Amex spend too.
+  authorised-but-unsettled Amex spend too. CREDITs are summed as
+  magnitudes (TrueLayer returns them negative), and payment CREDITs
+  (`PAYMENT RECEIVED - THANK YOU`) are excluded since `current` already
+  reflects them. Whether pending *merchant refunds* are also already in
+  `current` is unverified — they're subtracted for now.
+- **in_flight** — payments to Amex (DD or manual transfer) seen leaving
+  the Monzo current account in the last 7 days that TrueLayer doesn't
+  yet show as a payment CREDIT (pending or posted) of the same amount,
+  dated from the day before the payment onwards. Stateless — re-derived
+  each run, a payment stops counting once matched or 7 days old. Payee
+  match is `/american\s*exp|amex/i` on counterparty name + description:
+  Monzo truncates the payee to `AMERICAN EXP nnnn`. Logic and observed
+  data shapes are in `src/payments.ts`. The DD shows as "American
+  Express" (also matched); first one via the API is due ~15 Oct 2026 —
+  confirm with `npm run probe:payments`.
 - **pushes** — spends sent by an iPhone Shortcut (`POST /`) the instant
   they hit Apple Wallet, so the pot updates in ~1s instead of waiting
   for cron job to run every 15 minutes. Each push is dropped once a same-**amount** DEBIT
@@ -201,7 +217,7 @@ All routes require `Authorization: Bearer <WORKER_AUTH_SECRET>`.
 
 | Request | Effect |
 |---|---|
-| `GET /?dry=1` | Reconcile dry run — returns every figure (`posted_owed_pence`, `pending_debit_pence`, `pending_credit_pence`, `unmatched_push_pence`, `target_pence`, `pot_balance_pence`, `delta_pence`, `action`, `retired_push_ids`, `pending_ok`, `notes`), moves nothing |
+| `GET /?dry=1` | Reconcile dry run — returns every figure (`posted_owed_pence`, `pending_debit_pence`, `pending_credit_pence`, `unmatched_push_pence`, `in_flight_payment_pence`, `target_pence`, `pot_balance_pence`, `delta_pence`, `action`, `retired_push_ids`, `in_flight_payment_ids`, `pending_ok`, `notes`), moves nothing |
 | `GET /` | Reconcile now, for real |
 | `POST /` `{"amount_pence": 420}` or `{"amount": 4.20}` (optional `"note"`) | Record + immediately deposit a Shortcut push. Rejects ≤0 or >£10,000. De-dupes identical amounts pushed within 90s. |
 
@@ -253,9 +269,10 @@ so there's nothing to persist.
   with just the still-unmatched `kept` array once any push retires
   (matched against TrueLayer, or expired after `PUSH_RETIRE_AFTER_MS`).
   There's no separate history/archive collection.
-- TrueLayer's pending/posted transaction data is never written to KV
-  at all — `fetchAmexTransactions` pulls it fresh from the API every
-  run and it only lives in memory for that invocation.
+- TrueLayer's pending/posted transaction data and the Monzo current
+  account's recent transactions are never written to KV at all —
+  `fetchAmexTransactions` / `fetchMonzoTransactions` pull them fresh
+  every run and they only live in memory for that invocation.
 - The only durable record of what happened is Cloudflare's own
   observability Logs (dashboard **Logs** tab), and that's ~3-day
   retention, not permanent — and even within that window it only logs
@@ -271,6 +288,17 @@ budgeting history), that needs new code — nothing here provides it.
 - **Cloudflare's free plan allows 5 cron triggers per account** (not
   per Worker) — this project only needs one, but worth knowing if
   you're running other scheduled Workers on the same account.
+- **TrueLayer caches identical Data API requests for an hour** (see
+  `cache-control: max-age` on responses) — `X-PSU-IP` and a
+  `Cache-Control: no-cache` request header don't bypass it; a unique
+  query param does, so every TrueLayer call goes through `bustCache` in
+  `src/truelayer.ts`. Without it the hourly cron read the previous
+  run's balance (up to ~2h stale), which looked like a multi-day Amex
+  lag but wasn't: a manual payment reached `current` within minutes.
+- **`npm run probe:payments`** (read-only) dumps Amex-looking Monzo
+  transactions, all outgoing non-card payments, pot transfers, and
+  TrueLayer's raw balance + CREDITs — use it to check the payee/credit
+  patterns in `src/payments.ts` against real data.
 - **`--remote` on every `wrangler kv` command** that touches what the
   Worker reads — see Setup §5.
 - **TrueLayer consent expires ~90 days** (PSD2) regardless of use;

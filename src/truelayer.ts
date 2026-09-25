@@ -8,6 +8,20 @@ import type {
 const TRUELAYER_KV_KEY = "truelayer_tokens";
 
 /**
+ * TrueLayer serves an identical Data API request from a one-hour cache
+ * (`cache-control: max-age` on the response) — neither X-PSU-IP nor a
+ * `Cache-Control: no-cache` request header bypasses it, but a unique
+ * query param does. Without this the parameterless balance/pending
+ * calls return whatever the previous hourly run fetched, so the pot
+ * lagged the card by up to ~2 hours (verified 2026-09-25: cached
+ * `current` still showed a payment Amex had applied 8 minutes earlier).
+ */
+function bustCache(url: URL): string {
+  url.searchParams.set("_", String(Date.now()));
+  return url.toString();
+}
+
+/**
  * Returns a valid TrueLayer access token, refreshing it if needed.
  * TrueLayer access tokens are short-lived (~1 hour); the refresh_token
  * itself is tied to the Amex consent and will eventually expire or be
@@ -73,17 +87,20 @@ export async function getValidTrueLayerToken(env: Env): Promise<string> {
  * paid off, or in credit from an overpayment) — clamped to 0 here so the
  * reconcile target becomes "empty the pot".
  *
- * `current` reflects posted transactions only — pending Amex spend is not
- * included, so the pot trails pending spend by a few days by design.
+ * `current` excludes pending spend (the reconcile adds that separately),
+ * but a payment to the card lowers it as soon as the payment shows as a
+ * pending CREDIT (observed 2026-09-25) — see src/payments.ts.
  */
 export async function fetchAmexOwedPence(
   env: Env,
   accessToken: string
 ): Promise<{ owedPence: number; raw: TrueLayerCardBalance }> {
-  const res = await fetch(
-    `https://api.truelayer.com/data/v1/cards/${env.TRUELAYER_CARD_ACCOUNT_ID}/balance`,
-    { headers: { Authorization: `Bearer ${accessToken}` } }
+  const url = new URL(
+    `https://api.truelayer.com/data/v1/cards/${env.TRUELAYER_CARD_ACCOUNT_ID}/balance`
   );
+  const res = await fetch(bustCache(url), {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
   if (!res.ok) {
     throw new Error(
       `TrueLayer card balance fetch failed: ${res.status} ${await res.text()}`
@@ -128,7 +145,7 @@ export async function fetchAmexTransactions(
   if (opts.from) url.searchParams.set("from", opts.from);
   if (opts.to) url.searchParams.set("to", opts.to);
 
-  const res = await fetch(url.toString(), {
+  const res = await fetch(bustCache(url), {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
   const text = await res.text();
@@ -148,7 +165,7 @@ export async function fetchAmexTransactions(
   }
 }
 
-/** Pence value of a TrueLayer transaction amount. */
+/** Pence value of a TrueLayer transaction amount, sign kept (CREDITs are negative). */
 export function txPence(t: TrueLayerTransaction): number {
   return Math.round(t.amount * 100);
 }

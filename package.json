@@ -11,7 +11,8 @@
     "tail": "wrangler tail",
     "typecheck": "tsc --noEmit",
     "onboard:monzo": "node scripts/onboard.mjs monzo",
-    "onboard:truelayer": "node scripts/onboard.mjs truelayer"
+    "onboard:truelayer": "node scripts/onboard.mjs truelayer",
+    "probe:payments": "node scripts/probe-payments.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.0.0",

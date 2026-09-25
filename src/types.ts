@@ -47,6 +47,19 @@ export interface TrueLayerCardBalance {
   update_timestamp?: string;
 }
 
+// The subset of a Monzo /transactions entry the in-flight payment
+// detection reads. `amount` is signed pence from the current account's
+// side: negative = money out.
+export interface MonzoTransaction {
+  id: string;
+  created: string; // ISO
+  amount: number;
+  description: string;
+  scheme: string; // e.g. "bacs" (DD), "payport_faster_payments", "uk_retail_pot"
+  decline_reason?: string;
+  counterparty?: { name?: string };
+}
+
 // A spend pushed from the iPhone Shortcut the instant it happens on
 // Apple Wallet, before TrueLayer shows it. The reconcile counts these
 // toward the pot target until the matching transaction appears in

@@ -37,8 +37,9 @@ flowchart LR
 
 - **Target-balance reconcile, not per-transaction.** Each run asks
   "what's owed right now?" (TrueLayer's live card balance + pending
-  spend) and moves the difference into or out of the pot. No cursor, no
-  transaction ledger — self-correcting by construction.
+  spend, minus any bill payment that's left Monzo but not landed on the
+  card yet) and moves the difference into or out of the pot. No cursor,
+  no transaction ledger — self-correcting by construction.
 - **Two ways in:** an hourly cron does the heavy lifting; an Apple
   Shortcut triggered by a Wallet tap pushes an instant update so the
   pot updates in ~1 second instead of waiting for the next tick.

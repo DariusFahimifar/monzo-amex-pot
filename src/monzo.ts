@@ -1,4 +1,4 @@
-import type { Env, TokenSet } from "./types";
+import type { Env, MonzoTransaction, TokenSet } from "./types";
 
 const MONZO_KV_KEY = "monzo_tokens";
 
@@ -80,6 +80,37 @@ export async function getAmexPotBalancePence(
     );
   }
   return pot.balance;
+}
+
+/**
+ * Current-account transactions created since `sinceIso`, oldest first.
+ * Pages 100 at a time using the last id as the cursor. Throws on
+ * failure: the caller relies on this to spot in-flight card payments,
+ * and silently treating it as empty would refund a just-paid bill.
+ */
+export async function fetchMonzoTransactions(
+  env: Env,
+  accessToken: string,
+  sinceIso: string
+): Promise<MonzoTransaction[]> {
+  const out: MonzoTransaction[] = [];
+  let cursor = sinceIso;
+  for (;;) {
+    const url = new URL("https://api.monzo.com/transactions");
+    url.searchParams.set("account_id", env.MONZO_ACCOUNT_ID);
+    url.searchParams.set("since", cursor);
+    url.searchParams.set("limit", "100");
+    const res = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) {
+      throw new Error(`Monzo transactions fetch failed: ${res.status} ${await res.text()}`);
+    }
+    const { transactions } = (await res.json()) as { transactions: MonzoTransaction[] };
+    out.push(...transactions);
+    if (transactions.length < 100) return out;
+    cursor = transactions[transactions.length - 1].id;
+  }
 }
 
 /**

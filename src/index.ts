@@ -2,6 +2,7 @@ import type { Env, PushRecord, TrueLayerTransaction } from "./types";
 import {
   getValidMonzoToken,
   getAmexPotBalancePence,
+  fetchMonzoTransactions,
   movePotFunds,
 } from "./monzo";
 import {
@@ -10,6 +11,12 @@ import {
   fetchAmexTransactions,
   txPence,
 } from "./truelayer";
+import {
+  PAYMENT_LOOKBACK_MS,
+  absPence,
+  findInFlightPayments,
+  isCardPaymentCredit,
+} from "./payments";
 
 // ---------------------------------------------------------------------------
 // Model
@@ -20,9 +27,13 @@ import {
 //   target = max(0,
 //       posted_balance            (TrueLayer card `current`)
 //     + Σ pending DEBIT           (TrueLayer /transactions/pending)
-//     - Σ pending CREDIT
-//     + Σ unmatched push records) (spends the iPhone Shortcut pushed
+//     - Σ pending CREDIT          (refunds; payment CREDITs excluded —
+//                                  `current` already reflects those)
+//     + Σ unmatched push records  (spends the iPhone Shortcut pushed
 //                                  that TrueLayer can't see yet)
+//     - Σ in-flight payments)     (payments to the card that have left
+//                                  Monzo but not landed on the card
+//                                  yet — see src/payments.ts)
 //
 //   move (target - pot): deposit if positive, withdraw if negative.
 //
@@ -44,6 +55,9 @@ const PUSHED_PENDING_KV_KEY = "pushed_pending";
 
 const PUSH_RETIRE_AFTER_MS = 5 * 24 * 60 * 60 * 1000; // 5 days
 const POSTED_MATCH_LOOKBACK_MS = 5 * 24 * 60 * 60 * 1000; // 5 days
+// Posted fetch window: wide enough for both push matching and matching
+// in-flight payments to their CREDIT (payment date - 1 day onwards).
+const POSTED_FETCH_LOOKBACK_MS = PAYMENT_LOOKBACK_MS + 24 * 60 * 60 * 1000;
 const PUSH_DUPLICATE_WINDOW_MS = 90 * 1000; // Shortcut retry guard
 const PUSH_MAX_PENCE = 1_000_000; // £10k fat-finger guard on /push
 
@@ -52,20 +66,24 @@ interface ReconcileResult {
   pending_debit_pence: number;
   pending_credit_pence: number;
   unmatched_push_pence: number;
+  in_flight_payment_pence: number;
   target_pence: number;
   pot_balance_pence: number;
   delta_pence: number; // >0 deposited into pot, <0 withdrawn
   action: "deposit" | "withdraw" | "none";
   dry_run: boolean;
   retired_push_ids: string[];
+  in_flight_payment_ids: string[]; // Monzo transaction ids
   pending_ok: boolean;
   notes: string[];
 }
 
+// Magnitudes: TrueLayer reports CREDITs as negative amounts, so summing
+// signed values would turn "- pending CREDIT" into an addition.
 function sumPence(txns: TrueLayerTransaction[], type: "DEBIT" | "CREDIT"): number {
   return txns
     .filter((t) => t.transaction_type === type)
-    .reduce((s, t) => s + txPence(t), 0);
+    .reduce((s, t) => s + absPence(t), 0);
 }
 
 async function readPushes(env: Env): Promise<PushRecord[]> {
@@ -97,10 +115,13 @@ async function runReconcile(
     );
   }
   const pendingDebitPence = sumPence(pendingRes.transactions, "DEBIT");
-  const pendingCreditPence = sumPence(pendingRes.transactions, "CREDIT");
+  const pendingCreditPence = sumPence(
+    pendingRes.transactions.filter((t) => !isCardPaymentCredit(t)),
+    "CREDIT"
+  );
 
   const postedRes = await fetchAmexTransactions(env, tlToken, {
-    from: new Date(Date.now() - POSTED_MATCH_LOOKBACK_MS).toISOString(),
+    from: new Date(Date.now() - POSTED_FETCH_LOOKBACK_MS).toISOString(),
     to: new Date().toISOString(),
   });
   if (!postedRes.ok) {
@@ -109,9 +130,15 @@ async function runReconcile(
     );
   }
 
-  // Multiset of pence amounts a push can be matched against.
+  // Multiset of pence amounts a push can be matched against. Posted is
+  // fetched wider than push matching wants (for in-flight payments), so
+  // trim it back — a wider window means more stale same-amount matches.
+  const pushMatchFrom = Date.now() - POSTED_MATCH_LOOKBACK_MS;
+  const recentPosted = postedRes.transactions.filter(
+    (t) => Date.parse(t.timestamp) >= pushMatchFrom
+  );
   const matchable = new Map<number, number>();
-  for (const t of [...pendingRes.transactions, ...postedRes.transactions]) {
+  for (const t of [...pendingRes.transactions, ...recentPosted]) {
     if (t.transaction_type !== "DEBIT") continue;
     const p = txPence(t);
     matchable.set(p, (matchable.get(p) ?? 0) + 1);
@@ -137,12 +164,34 @@ async function runReconcile(
   }
   const unmatchedPushPence = kept.reduce((s, p) => s + p.amount_pence, 0);
 
+  const monzoToken = await getValidMonzoToken(env);
+
+  // If a TrueLayer transactions fetch failed, a payment that has already
+  // landed can't be matched and gets subtracted a second time — the pot under-funds
+  // (the safe direction) until the next run.
+  const monzoTxns = await fetchMonzoTransactions(
+    env,
+    monzoToken,
+    new Date(now - PAYMENT_LOOKBACK_MS).toISOString()
+  );
+  const inFlight = findInFlightPayments(monzoTxns, [
+    ...pendingRes.transactions,
+    ...postedRes.transactions,
+  ]);
+  const inFlightPence = inFlight.reduce((s, p) => s + p.amount_pence, 0);
+  for (const p of inFlight) {
+    notes.push(`payment ${p.id} (${p.amount_pence}p, ${p.created}) in flight`);
+  }
+
   const target = Math.max(
     0,
-    owedPence + pendingDebitPence - pendingCreditPence + unmatchedPushPence
+    owedPence +
+      pendingDebitPence -
+      pendingCreditPence +
+      unmatchedPushPence -
+      inFlightPence
   );
 
-  const monzoToken = await getValidMonzoToken(env);
   const potPence = await getAmexPotBalancePence(env, monzoToken);
   const delta = target - potPence;
   const action: ReconcileResult["action"] =
@@ -169,12 +218,14 @@ async function runReconcile(
     pending_debit_pence: pendingDebitPence,
     pending_credit_pence: pendingCreditPence,
     unmatched_push_pence: unmatchedPushPence,
+    in_flight_payment_pence: inFlightPence,
     target_pence: target,
     pot_balance_pence: potPence,
     delta_pence: delta,
     action,
     dry_run: dryRun,
     retired_push_ids: retired,
+    in_flight_payment_ids: inFlight.map((p) => p.id),
     pending_ok: pendingRes.ok,
     notes,
   };
@@ -303,6 +354,7 @@ export default {
               `${r.action} ${Math.abs(r.delta_pence)}p ` +
               `(owed=${r.posted_owed_pence} pendD=${r.pending_debit_pence} ` +
               `pendC=${r.pending_credit_pence} push=${r.unmatched_push_pence} ` +
+              `inflight=${r.in_flight_payment_pence} ` +
               `retired=${r.retired_push_ids.length})`
           );
           if (r.notes.length) console.log("notes:", r.notes.join(" | "));
